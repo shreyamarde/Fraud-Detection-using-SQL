@@ -1,0 +1,207 @@
+
+-- RULE-BASED FRAUD DETECTION SYSTEM
+
+
+DROP DATABASE IF EXISTS fraud_detection;
+CREATE DATABASE fraud_detection;
+USE fraud_detection;
+
+CREATE TABLE Users (
+    user_id INT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(100) NOT NULL,
+    email VARCHAR(100) UNIQUE,
+    phone VARCHAR(15),
+    risk_score INT DEFAULT 0,        
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE Accounts (
+    account_id INT PRIMARY KEY AUTO_INCREMENT,
+    user_id INT,
+    account_type VARCHAR(20) DEFAULT 'savings',
+    balance DECIMAL(12,2) DEFAULT 0,
+    status VARCHAR(20) DEFAULT 'active',
+    opened_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES Users(user_id)
+);
+
+CREATE TABLE Cards (
+    card_id INT PRIMARY KEY AUTO_INCREMENT,
+    account_id INT,
+    card_number_hash VARCHAR(64),   
+    card_type VARCHAR(20) DEFAULT 'debit',
+    status VARCHAR(20) DEFAULT 'active',
+    expiry DATE,
+    FOREIGN KEY (account_id) REFERENCES Accounts(account_id)
+);
+
+CREATE TABLE Devices (
+    device_id INT PRIMARY KEY AUTO_INCREMENT,
+    user_id INT,
+    device_fingerprint VARCHAR(100),
+    first_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES Users(user_id)
+);
+
+CREATE TABLE Transactions (
+    txn_id INT PRIMARY KEY AUTO_INCREMENT,
+    account_id INT,
+    card_id INT,
+    device_id INT,
+    amount DECIMAL(12,2),
+    location VARCHAR(50),
+    txn_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+    status VARCHAR(20) DEFAULT 'pending',
+    FOREIGN KEY (account_id) REFERENCES Accounts(account_id),
+    FOREIGN KEY (card_id) REFERENCES Cards(card_id),
+    FOREIGN KEY (device_id) REFERENCES Devices(device_id)
+);
+
+CREATE TABLE FraudFlags (
+    flag_id INT PRIMARY KEY AUTO_INCREMENT,
+    txn_id INT,
+    rule_triggered VARCHAR(50),
+    severity VARCHAR(10),           -- low / medium / high
+    flagged_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    reviewed BOOLEAN DEFAULT FALSE,
+    FOREIGN KEY (txn_id) REFERENCES Transactions(txn_id)
+);
+
+DELIMITER //
+
+CREATE PROCEDURE EvaluateFraudRules(IN p_txn_id INT)
+BEGIN
+    DECLARE v_account_id INT;
+    DECLARE v_device_id INT;
+    DECLARE v_amount DECIMAL(12,2);
+    DECLARE v_avg_amount DECIMAL(12,2);
+    DECLARE v_recent_count INT;
+    DECLARE v_known_device INT;
+
+    SELECT account_id, device_id, amount
+    INTO v_account_id, v_device_id, v_amount
+    FROM Transactions
+    WHERE txn_id = p_txn_id;
+
+    -- RULE 1: Velocity check
+    -- more than 3 transactions from same account in last 10 minutes
+    SELECT COUNT(*) INTO v_recent_count
+    FROM Transactions
+    WHERE account_id = v_account_id
+      AND txn_time >= (NOW() - INTERVAL 10 MINUTE);
+
+    IF v_recent_count > 3 THEN
+        INSERT INTO FraudFlags(txn_id, rule_triggered, severity)
+        VALUES (p_txn_id, 'Velocity Check', 'medium');
+    END IF;
+
+    -- RULE 2: Amount anomaly
+    -- transaction amount > 5x account's average transaction
+    SELECT AVG(amount) INTO v_avg_amount
+    FROM Transactions
+    WHERE account_id = v_account_id;
+
+    IF v_avg_amount IS NOT NULL AND v_amount > (5 * v_avg_amount) THEN
+        INSERT INTO FraudFlags(txn_id, rule_triggered, severity)
+        VALUES (p_txn_id, 'Amount Anomaly', 'high');
+    END IF;
+
+    -- RULE 3: New device + high value transaction
+    SELECT COUNT(*) INTO v_known_device
+    FROM Transactions
+    WHERE device_id = v_device_id AND txn_id <> p_txn_id;
+
+    IF v_known_device = 0 AND v_amount > 10000 THEN
+        INSERT INTO FraudFlags(txn_id, rule_triggered, severity)
+        VALUES (p_txn_id, 'New Device High Value', 'high');
+    END IF;
+
+    -- RULE 4: Structuring pattern
+    -- amount suspiciously just under a round reporting threshold
+    IF v_amount BETWEEN 9000 AND 9999 THEN
+        INSERT INTO FraudFlags(txn_id, rule_triggered, severity)
+        VALUES (p_txn_id, 'Structuring Pattern', 'low');
+    END IF;
+
+    -- Update user risk score based on flags raised for this txn
+    UPDATE Users u
+    JOIN Accounts a ON u.user_id = a.user_id
+    SET u.risk_score = u.risk_score +
+        (SELECT COUNT(*) FROM FraudFlags WHERE txn_id = p_txn_id) * 10
+    WHERE a.account_id = v_account_id;
+
+END //
+
+DELIMITER ;
+
+DELIMITER //
+
+CREATE TRIGGER trg_after_transaction_insert
+AFTER INSERT ON Transactions
+FOR EACH ROW
+BEGIN
+    CALL EvaluateFraudRules(NEW.txn_id);
+END //
+
+DELIMITER ;
+-- sample data
+INSERT INTO Users (name, email, phone) VALUES
+('Aarav Sharma', 'aarav@mail.com', '9876543210'),
+('Riya Mehta', 'riya@mail.com', '9876543211'),
+('Karan Patel', 'karan@mail.com', '9876543212');
+
+INSERT INTO Accounts (user_id, account_type, balance) VALUES
+(1, 'savings', 50000),
+(2, 'savings', 20000),
+(3, 'current', 100000);
+
+INSERT INTO Cards (account_id, card_number_hash, expiry) VALUES
+(1, 'hash_card_001', '2028-01-01'),
+(2, 'hash_card_002', '2027-05-01'),
+(3, 'hash_card_003', '2026-11-01');
+
+-- Insert all devices first, before any transactions
+INSERT INTO Devices (user_id, device_fingerprint) VALUES
+(1, 'device_aarav_phone'),      -- device_id = 1
+(2, 'device_riya_laptop'),      -- device_id = 2
+(3, 'device_karan_phone'),      -- device_id = 3
+(3, 'device_karan_new_laptop'); -- device_id = 4  <-- FIX: inserted before transactions
+
+-- Normal transaction
+INSERT INTO Transactions (account_id, card_id, device_id, amount, location)
+VALUES (1, 1, 1, 1500, 'Pune');
+
+-- Triggers Amount Anomaly (way above average for account 1)
+INSERT INTO Transactions (account_id, card_id, device_id, amount, location)
+VALUES (1, 1, 1, 45000, 'Pune');
+
+-- Triggers Structuring Pattern
+INSERT INTO Transactions (account_id, card_id, device_id, amount, location)
+VALUES (2, 2, 2, 9800, 'Mumbai');
+
+-- New device (device_id = 4) + high value -> triggers New Device High Value
+INSERT INTO Transactions (account_id, card_id, device_id, amount, location)
+VALUES (3, 3, 4, 25000, 'Delhi');
+
+-- Multiple quick transactions on account 1 -> triggers Velocity Check
+INSERT INTO Transactions (account_id, card_id, device_id, amount, location) VALUES (1, 1, 1, 500, 'Pune');
+INSERT INTO Transactions (account_id, card_id, device_id, amount, location) VALUES (1, 1, 1, 700, 'Pune');
+INSERT INTO Transactions (account_id, card_id, device_id, amount, location) VALUES (1, 1, 1, 600, 'Pune');
+INSERT INTO Transactions (account_id, card_id, device_id, amount, location) VALUES (1, 1, 1, 800, 'Pune');
+-- demo queries
+
+-- All flagged transactions with user info
+SELECT u.name, t.txn_id, t.amount, f.rule_triggered, f.severity, f.flagged_at
+FROM FraudFlags f
+JOIN Transactions t ON f.txn_id = t.txn_id
+JOIN Accounts a ON t.account_id = a.account_id
+JOIN Users u ON a.user_id = u.user_id
+ORDER BY f.flagged_at DESC;
+
+-- Risk score leaderboard
+SELECT name, risk_score FROM Users ORDER BY risk_score DESC;
+
+-- How many times each rule fired
+SELECT rule_triggered, COUNT(*) AS times_triggered
+FROM FraudFlags
+GROUP BY rule_triggered;
